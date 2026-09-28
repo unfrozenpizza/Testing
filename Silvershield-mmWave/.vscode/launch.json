@@ -1,0 +1,19 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"type": "nrf-connect",
+			"request": "launch",
+			"name": "Launch Silvershield-mmWave/build",
+			"config": "${workspaceFolder}/build",
+			"runToEntryPoint": "main"
+		},
+		{
+			"type": "nrf-connect",
+			"request": "launch",
+			"name": "Launch Silvershield-mmWave/build/Silvershield-mmWave",
+			"config": "${workspaceFolder}/build/Silvershield-mmWave",
+			"runToEntryPoint": "main"
+		}
+	]
+}
