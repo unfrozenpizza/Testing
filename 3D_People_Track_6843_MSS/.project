@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<projectDescription>
+	<name>3D_People_Track_6843_MSS</name>
+	<comment></comment>
+	<projects>
+		<project>3D_people_track_6843_dss</project>
+	</projects>
+	<buildSpec>
+		<buildCommand>
+			<name>org.eclipse.cdt.managedbuilder.core.genmakebuilder</name>
+			<arguments>
+			</arguments>
+		</buildCommand>
+	</buildSpec>
+	<natures>
+		<nature>org.eclipse.rtsc.xdctools.buildDefinitions.XDC.xdcNature</nature>
+		<nature>com.ti.ccstudio.core.ccsNature</nature>
+		<nature>org.eclipse.cdt.core.cnature</nature>
+		<nature>org.eclipse.cdt.managedbuilder.core.managedBuildNature</nature>
+		<nature>org.eclipse.cdt.core.ccnature</nature>
+	</natures>
+	<variableList>
+		<variable>
+			<name>MODIFIED_SDK3_DATAPATH</name>
+			<value>$%7BCOM_TI_RADAR_TOOLBOX_INSTALL_DIR%7D/source/ti/custom_sdk_files/sdk3</value>
+		</variable>
+		<variable>
+			<name>RTB_INSTALL_DIR</name>
+			<value>$%7BCOM_TI_RADAR_TOOLBOX_INSTALL_DIR%7D</value>
+		</variable>
+	</variableList>
+</projectDescription>

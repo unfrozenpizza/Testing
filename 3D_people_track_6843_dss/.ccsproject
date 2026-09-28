@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<?ccsproject version="1.0"?>
+<projectOptions>
+	<ccsVariant value="50:Theia-based"/>
+	<ccsVersion value="71.0.1"/>
+	<deviceFamily value="C6000"/>
+	<executableActions value=""/>
+	<createSlaveProjects value=""/>
+	<templateProperties value="id=3D_people_track_6843_dss.projectspec.3D_people_track_6843_dss,type=rtsc,products=com.ti.rtsc.SYSBIOS:6.73.01.01;com.ti.MMWAVE_SDK:03.05.00.04,xdcToolsVersion=3.50.08.24_core,target=ti.targets.elf.C674,platform=ti.platforms.c6x:IWR68XX:false:600,endianness=little,output_format=elf,buildProfile=release,configuroOptions=--compileOptions &quot;--enum_type=int &quot; "/>
+	<origin value="C:\ti\radar_toolbox_4_00_00_05\source\ti\examples\Industrial_and_Personal_Electronics\People_Tracking\3D_People_Tracking\src\6843\3D_people_track_6843_dss.projectspec"/>
+	<filesToOpen value=""/>
+</projectOptions>
