@@ -4,7 +4,7 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(Silvershield-mmWave)
 
 # Add your main application source
-target_sources(app PRIVATE src/main.cpp)
+target_sources(app PRIVATE src/main.cpp src/mesh_alerts.c)
 
 # Include the Edge Impulse build logic inside src/
 add_subdirectory(src)

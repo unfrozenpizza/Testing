@@ -92,12 +92,12 @@ char* hardcodedConfig[] = {
     "compRangeBiasAndRxChanPhase 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0\n",
     "staticBoundaryBox -3 3 0.5 7.5 0 3\n",
     "boundaryBox -4 4 0 8 0 3\n",
-    "sensorPosition 1 0 15\n",
+    "sensorPosition 0.85 0 15\n",  /* desk trial: 0.85 m high, tilted 15 deg down. Update for wall mount */
     "gatingParam 3 3 3 4 10\n",
     "stateParam 3 3 50 500 5 6000\n",
     "allocationParam 40 100 0.1 20 0.5 20\n",
     "maxAcceleration 0.5 0.5 5.0\n",
-    "trackingCfg 1 2 800 30 46 96 55\n",
+    "trackingCfg 1 2 800 30 46 96 200\n",   /* last arg = frame period in ms, must match frameCfg (200 ms) */
     "presenceBoundaryBox -3 3 0.5 7.5 0 3\n",
     "sensorStart\n"
 };
