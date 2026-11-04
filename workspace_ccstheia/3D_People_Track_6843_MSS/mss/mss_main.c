@@ -85,6 +85,14 @@
 #include <xdc/runtime/System.h>
 #define FALLDET_MAX_TID 256 // Tracker IDs are < GTRACK_NUM_TRACKS_MAX (200)
 
+/* Fall detection tuning (heights are metres above the floor) */
+#define FALLDET_FALL_HEIGHT_M      0.40f  // below this counts as "on the floor"
+#define FALLDET_RECOVER_HEIGHT_M   0.60f  // above this clears a fall (RECOVER)
+#define FALLDET_FAST_FALL_VEL_MPS  (-1.1f) // downward speed (m/s) for an instant fall
+#define FALLDET_CONFIRM_FRAMES     15     // frames low before a slow fall is confirmed (200 ms/frame -> 3 s)
+#define FALLDET_LOST_HOLD_FRAMES   25     // frames a track lost while low is held before EXIT (200 ms/frame -> 5 s);
+                                          // the tracker tends to drop a person lying still on the floor
+
 
 /*end of new*/
 /* BIOS/XDC Include Files. */
@@ -825,9 +833,10 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
             static uint8_t  fallLatched[FALLDET_MAX_TID]      = {0};
             static uint8_t  lastFallState[FALLDET_MAX_TID]    = {0};
             static uint16_t fallFrameCounter[FALLDET_MAX_TID] = {0};
-            static uint8_t  activeTargets[FALLDET_MAX_TID]    = {0}; // Who was here last frame?
+            static uint8_t  activeTargets[FALLDET_MAX_TID]    = {0}; // Who was here last frame (or is held, see lostHold)?
             static uint8_t  currentFrameIDs[FALLDET_MAX_TID];        // Who is here right now? (static: keeps it off the task stack)
-            const int CONFIRM_THRESHOLD = 40;
+            static float    lastHeight[FALLDET_MAX_TID];             // Height when last seen (m above floor)
+            static uint8_t  lostHold[FALLDET_MAX_TID]         = {0}; // >0: track lost while low, frames left before EXIT
             trackerProc_Target *targets = (trackerProc_Target *)tList;
             char uartMsgBuf[32];                                     // Buffer for our text messages
             uint32_t f_t;
@@ -840,7 +849,8 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
             {
                 uint32_t id = targets[f_t].tid;
                 float velocityZ = targets[f_t].velZ;
-                float currentZ = targets[f_t].posZ + 1.0f;
+                // Tracker already reports Z as height above the floor (via sensorPosition), so no offset
+                float currentZ = targets[f_t].posZ;
 
                 if (id >= FALLDET_MAX_TID)
                 {
@@ -849,7 +859,14 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
 
                 // --- ENTRY DETECTION ---
                 currentFrameIDs[id] = 1; // Mark this ID as seen in the current frame
-                if (activeTargets[id] == 0)
+                lastHeight[id] = currentZ;
+                if (lostHold[id] > 0)
+                {
+                    // Held track came back: it never EXITed, so no new ENTRY. The fall logic
+                    // below sends RECOVER if it is now standing and FALL had been sent.
+                    lostHold[id] = 0;
+                }
+                else if (activeTargets[id] == 0)
                 {
                     activeTargets[id] = 1; // Save to our historical state
                     sprintf(uartMsgBuf, "ENTRY:%u\r\n", (unsigned int)id);
@@ -857,22 +874,22 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
                 }
 
                 // --- EXISTING FALL DETECTION MATH ---
-                if (currentZ < 0.4f && velocityZ < -1.1f) //use 0.9 and -0.2 for testing
+                if (currentZ < FALLDET_FALL_HEIGHT_M && velocityZ < FALLDET_FAST_FALL_VEL_MPS)
                 {
                     fallLatched[id] = 1;
                 }
-                else if (currentZ < 0.40f) //use 0.9 to test logic
+                else if (currentZ < FALLDET_FALL_HEIGHT_M)
                 {
-                    if (fallFrameCounter[id] < CONFIRM_THRESHOLD)
+                    if (fallFrameCounter[id] < FALLDET_CONFIRM_FRAMES)
                     {
                         fallFrameCounter[id]++;
                     }
-                    if (fallFrameCounter[id] >= CONFIRM_THRESHOLD)
+                    if (fallFrameCounter[id] >= FALLDET_CONFIRM_FRAMES)
                     {
                         fallLatched[id] = 1;
                     }
                 }
-                else if (currentZ > 0.60f) //use 0.9 to test logic
+                else if (currentZ > FALLDET_RECOVER_HEIGHT_M)
                 {
                     fallLatched[id] = 0;
                     fallFrameCounter[id] = 0;
@@ -895,11 +912,52 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
             } // End of Target Loop
 
             // --- EXIT DETECTION ---
-            // IDs that were active previously but aren't in this frame have left.
+            // IDs that were active previously but aren't in this frame have left, unless they were
+            // lost while low (fallen, or falling): those are held for FALLDET_LOST_HOLD_FRAMES first.
             for (i = 0; i < FALLDET_MAX_TID; i++)
             {
                 if (activeTargets[i] == 1 && currentFrameIDs[i] == 0)
                 {
+                    if (lostHold[i] == 0 &&
+                        (lastHeight[i] < FALLDET_FALL_HEIGHT_M || fallLatched[i] || fallFrameCounter[i] > 0))
+                    {
+                        // Just lost while low: start holding instead of reporting EXIT.
+                        lostHold[i] = FALLDET_LOST_HOLD_FRAMES;
+                    }
+
+                    if (lostHold[i] > 0)
+                    {
+                        // Not visible but assumed still on the floor: keep counting towards
+                        // a slow-fall confirmation, and send FALL once it is confirmed.
+                        if (fallFrameCounter[i] < FALLDET_CONFIRM_FRAMES)
+                        {
+                            fallFrameCounter[i]++;
+                        }
+                        if (fallFrameCounter[i] >= FALLDET_CONFIRM_FRAMES)
+                        {
+                            fallLatched[i] = 1;
+                        }
+
+                        lostHold[i]--;
+                        if (lostHold[i] == 0 && fallFrameCounter[i] > 0)
+                        {
+                            // Hold expired with a fall still pending: report it before EXIT.
+                            fallLatched[i] = 1;
+                        }
+
+                        if (fallLatched[i] == 1 && lastFallState[i] == 0)
+                        {
+                            sprintf(uartMsgBuf, "FALL:%d\r\n", i);
+                            UART_write(uartHandle, (uint8_t*)uartMsgBuf, strlen(uartMsgBuf));
+                            lastFallState[i] = 1;
+                        }
+
+                        if (lostHold[i] > 0)
+                        {
+                            continue; // still held: no EXIT yet
+                        }
+                    }
+
                     activeTargets[i] = 0; // Remove from our historical state
 
                     // Reset fall states so it's clean if the ID is reused
