@@ -92,6 +92,15 @@
 #define FALLDET_CONFIRM_FRAMES     15     // frames low before a slow fall is confirmed (200 ms/frame -> 3 s)
 #define FALLDET_LOST_HOLD_FRAMES   25     // frames a track lost while low is held before EXIT (200 ms/frame -> 5 s);
                                           // the tracker tends to drop a person lying still on the floor
+#define FALLDET_SMOOTH_ALPHA       0.35f  // height smoothing per frame (0..1, lower = smoother/slower); ~0.5 s
+#define FALLDET_FAST_DROP_CM       40     // height drop (cm) from recent peak that counts as a fast fall
+#define FALLDET_PEAK_DECAY_CM      2      // recent-peak height forgets 2 cm per frame (0.1 m/s)
+#define FALLDET_RECOVER_FRACTION   0.70f  // also RECOVER above 70% of this person's own standing height...
+#define FALLDET_RECOVER_MIN_GAP_M  0.10f  // ...but never less than 0.10 m above the fall line
+#define FALLDET_MAX_STAND_M        2.20f  // ignore heights above this when learning standing height
+#define FALLDET_MAX_SPOTS          8      // fallen spots remembered at once
+#define FALLDET_SPOT_RADIUS_CM     100    // a new track within 1 m of a fallen spot is the same person
+#define FALLDET_SPOT_KEEP_FRAMES   600    // fallen spot kept for 600 frames (200 ms/frame -> 2 min)
 
 
 /*end of new*/
@@ -828,21 +837,52 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
 
 // --------------- BEGIN: MIDDLEMAN FALL DETECTION & SEND ----------------
         /* Runs every frame, including frames with no targets, so EXIT is still
-         * sent when the last person leaves. */
+         * sent when the last person leaves.
+         *
+         * Heights are smoothed (~0.5 s) before any decision, so one noisy 200 ms frame
+         * can't cause or miss a fall. A fall is "smoothed height low AND (dropped 40 cm+ from its recent peak, or
+         * fast downward speed, OR stayed low for FALLDET_CONFIRM_FRAMES)".
+         * Recovery is judged against the person's own standing height, and survives the
+         * tracker changing their ID (see "fallen spots" below). */
         {
             static uint8_t  fallLatched[FALLDET_MAX_TID]      = {0};
             static uint8_t  lastFallState[FALLDET_MAX_TID]    = {0};
             static uint16_t fallFrameCounter[FALLDET_MAX_TID] = {0};
             static uint8_t  activeTargets[FALLDET_MAX_TID]    = {0}; // Who was here last frame (or is held, see lostHold)?
             static uint8_t  currentFrameIDs[FALLDET_MAX_TID];        // Who is here right now? (static: keeps it off the task stack)
-            static float    lastHeight[FALLDET_MAX_TID];             // Height when last seen (m above floor)
+            static float    lastHeight[FALLDET_MAX_TID];             // Smoothed height when last seen (m above floor)
             static uint8_t  lostHold[FALLDET_MAX_TID]         = {0}; // >0: track lost while low, frames left before EXIT
+            static float    smoothZ[FALLDET_MAX_TID];                // Smoothed height (m)
+            static int16_t  peakZcm[FALLDET_MAX_TID];                // Recent peak height (cm), decays FALLDET_PEAK_DECAY_CM per frame
+            static int16_t  standZcm[FALLDET_MAX_TID];               // Highest smoothed height seen for this track (cm)
+            static int16_t  lastXcm[FALLDET_MAX_TID];                // Position when last seen (cm), for fallen spots
+            static int16_t  lastYcm[FALLDET_MAX_TID];
+            static uint8_t  aliasOf[FALLDET_MAX_TID]          = {0}; // >0: this track is fallen person (aliasOf-1) under a new ID
+
+            /* Fallen spots: where a fallen person's track was finally lost. A new track that
+             * appears near one is taken to be the same person, so their RECOVER is sent
+             * under the ID that sent FALL. */
+            static struct {
+                int16_t  xcm, ycm;
+                uint16_t framesLeft; // 0 = slot free
+                uint8_t  reportId;   // ID that sent FALL
+            } fallenSpot[FALLDET_MAX_SPOTS];
+
             trackerProc_Target *targets = (trackerProc_Target *)tList;
             char uartMsgBuf[32];                                     // Buffer for our text messages
             uint32_t f_t;
-            int i;
+            int i, s;
 
             memset(currentFrameIDs, 0, sizeof(currentFrameIDs));
+
+            // Age the fallen spots
+            for (s = 0; s < FALLDET_MAX_SPOTS; s++)
+            {
+                if (fallenSpot[s].framesLeft > 0)
+                {
+                    fallenSpot[s].framesLeft--;
+                }
+            }
 
             // Fall & Entry test on every tracked target
             for (f_t = 0; (targets != NULL) && (f_t < numTargets); f_t++)
@@ -850,7 +890,11 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
                 uint32_t id = targets[f_t].tid;
                 float velocityZ = targets[f_t].velZ;
                 // Tracker already reports Z as height above the floor (via sensorPosition), so no offset
-                float currentZ = targets[f_t].posZ;
+                float rawZ = targets[f_t].posZ;
+                int16_t rawZcm;
+                float z;
+                uint8_t isNew = 0;
+                uint8_t reportId;
 
                 if (id >= FALLDET_MAX_TID)
                 {
@@ -859,7 +903,6 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
 
                 // --- ENTRY DETECTION ---
                 currentFrameIDs[id] = 1; // Mark this ID as seen in the current frame
-                lastHeight[id] = currentZ;
                 if (lostHold[id] > 0)
                 {
                     // Held track came back: it never EXITed, so no new ENTRY. The fall logic
@@ -869,42 +912,130 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
                 else if (activeTargets[id] == 0)
                 {
                     activeTargets[id] = 1; // Save to our historical state
+                    isNew = 1;
                     sprintf(uartMsgBuf, "ENTRY:%u\r\n", (unsigned int)id);
                     UART_write(uartHandle, (uint8_t*)uartMsgBuf, strlen(uartMsgBuf));
                 }
 
-                // --- EXISTING FALL DETECTION MATH ---
-                if (currentZ < FALLDET_FALL_HEIGHT_M && velocityZ < FALLDET_FAST_FALL_VEL_MPS)
+                lastXcm[id] = (int16_t)(targets[f_t].posX * 100.0f);
+                lastYcm[id] = (int16_t)(targets[f_t].posY * 100.0f);
+
+                // --- HEIGHT SMOOTHING ---
+                rawZcm = (int16_t)(rawZ * 100.0f);
+                if (isNew)
                 {
-                    fallLatched[id] = 1;
-                }
-                else if (currentZ < FALLDET_FALL_HEIGHT_M)
-                {
-                    if (fallFrameCounter[id] < FALLDET_CONFIRM_FRAMES)
+                    smoothZ[id]  = rawZ;
+                    peakZcm[id]  = rawZcm;
+                    standZcm[id] = 0;
+                    aliasOf[id]  = 0;
+                    fallLatched[id] = 0;
+                    lastFallState[id] = 0;
+                    fallFrameCounter[id] = 0;
+
+                    // New track born near a fallen spot: same person, tracker gave a new ID.
+                    // Carry the fall over (no second FALL); RECOVER will use the old ID.
+                    for (s = 0; s < FALLDET_MAX_SPOTS; s++)
                     {
-                        fallFrameCounter[id]++;
+                        int32_t dx, dy;
+                        if (fallenSpot[s].framesLeft == 0)
+                        {
+                            continue;
+                        }
+                        dx = (int32_t)lastXcm[id] - fallenSpot[s].xcm;
+                        dy = (int32_t)lastYcm[id] - fallenSpot[s].ycm;
+                        if (dx * dx + dy * dy <= (int32_t)FALLDET_SPOT_RADIUS_CM * FALLDET_SPOT_RADIUS_CM)
+                        {
+                            aliasOf[id] = (uint8_t)(fallenSpot[s].reportId + 1);
+                            fallLatched[id] = 1;
+                            lastFallState[id] = 1;
+                            fallFrameCounter[id] = FALLDET_CONFIRM_FRAMES;
+                            fallenSpot[s].framesLeft = 0;
+                            break;
+                        }
                     }
-                    if (fallFrameCounter[id] >= FALLDET_CONFIRM_FRAMES)
+                }
+                else
+                {
+                    smoothZ[id] += FALLDET_SMOOTH_ALPHA * (rawZ - smoothZ[id]);
+                    if (peakZcm[id] > FALLDET_PEAK_DECAY_CM)
+                    {
+                        peakZcm[id] -= FALLDET_PEAK_DECAY_CM;
+                    }
+                    if (rawZcm > peakZcm[id])
+                    {
+                        peakZcm[id] = rawZcm;
+                    }
+                }
+                z = smoothZ[id];
+                lastHeight[id] = z;
+
+                // Learn standing height from smoothed values only (ignores one-frame spikes)
+                if ((int16_t)(z * 100.0f) > standZcm[id] && z < FALLDET_MAX_STAND_M)
+                {
+                    standZcm[id] = (int16_t)(z * 100.0f);
+                }
+
+                // --- FALL DETECTION ---
+                {
+                    // Recover when back above RECOVER_HEIGHT_M, or above RECOVER_FRACTION of this
+                    // person's own standing height if that is lower (low-mounted radar tends to
+                    // read heights low). Never closer than RECOVER_MIN_GAP_M to the fall line.
+                    float recoverZ = FALLDET_RECOVER_HEIGHT_M;
+                    float relZ = FALLDET_RECOVER_FRACTION * ((float)standZcm[id] / 100.0f);
+                    uint8_t droppedFast;
+
+                    if (relZ < recoverZ)
+                    {
+                        recoverZ = relZ;
+                    }
+                    if (recoverZ < FALLDET_FALL_HEIGHT_M + FALLDET_RECOVER_MIN_GAP_M)
+                    {
+                        recoverZ = FALLDET_FALL_HEIGHT_M + FALLDET_RECOVER_MIN_GAP_M;
+                    }
+
+                    droppedFast = (uint8_t)((velocityZ < FALLDET_FAST_FALL_VEL_MPS) ||
+                                            ((int32_t)peakZcm[id] - (int32_t)rawZcm >= FALLDET_FAST_DROP_CM));
+
+                    if (z < FALLDET_FALL_HEIGHT_M && droppedFast)
                     {
                         fallLatched[id] = 1;
                     }
-                }
-                else if (currentZ > FALLDET_RECOVER_HEIGHT_M)
-                {
-                    fallLatched[id] = 0;
-                    fallFrameCounter[id] = 0;
+                    else if (z < FALLDET_FALL_HEIGHT_M)
+                    {
+                        if (fallFrameCounter[id] < FALLDET_CONFIRM_FRAMES)
+                        {
+                            fallFrameCounter[id]++;
+                        }
+                        if (fallFrameCounter[id] >= FALLDET_CONFIRM_FRAMES)
+                        {
+                            fallLatched[id] = 1;
+                        }
+                    }
+                    else if (z > recoverZ)
+                    {
+                        fallLatched[id] = 0;
+                        fallFrameCounter[id] = 0;
+                    }
+                    else if (!fallLatched[id])
+                    {
+                        // Between the lines and not fallen (e.g. sitting): don't keep counting
+                        // towards a slow fall from earlier low frames.
+                        fallFrameCounter[id] = 0;
+                    }
                 }
 
                 // --- FALL OUTPUT TO NORDIC ---
+                reportId = (uint8_t)(aliasOf[id] ? (uint32_t)(aliasOf[id] - 1) : id);
                 if (fallLatched[id] != lastFallState[id])
                 {
                     if (fallLatched[id] == 1)
                     {
-                        sprintf(uartMsgBuf, "FALL:%u\r\n", (unsigned int)id);
+                        sprintf(uartMsgBuf, "FALL:%u\r\n", (unsigned int)reportId);
                     }
                     else
                     {
-                        sprintf(uartMsgBuf, "RECOVER:%u\r\n", (unsigned int)id);
+                        sprintf(uartMsgBuf, "RECOVER:%u\r\n", (unsigned int)reportId);
+                        aliasOf[id] = 0; // later falls are reported under this track's own ID
                     }
                     UART_write(uartHandle, (uint8_t*)uartMsgBuf, strlen(uartMsgBuf));
                     lastFallState[id] = fallLatched[id];
@@ -918,6 +1049,8 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
             {
                 if (activeTargets[i] == 1 && currentFrameIDs[i] == 0)
                 {
+                    uint8_t reportId = (uint8_t)(aliasOf[i] ? (aliasOf[i] - 1) : i);
+
                     if (lostHold[i] == 0 &&
                         (lastHeight[i] < FALLDET_FALL_HEIGHT_M || fallLatched[i] || fallFrameCounter[i] > 0))
                     {
@@ -947,7 +1080,7 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
 
                         if (fallLatched[i] == 1 && lastFallState[i] == 0)
                         {
-                            sprintf(uartMsgBuf, "FALL:%d\r\n", i);
+                            sprintf(uartMsgBuf, "FALL:%u\r\n", (unsigned int)reportId);
                             UART_write(uartHandle, (uint8_t*)uartMsgBuf, strlen(uartMsgBuf));
                             lastFallState[i] = 1;
                         }
@@ -958,12 +1091,31 @@ void MmwDemo_uartTxTask(UArg arg0, UArg arg1)
                         }
                     }
 
+                    // Leaving while fallen: remember where, so a new track that appears there
+                    // (the same person, re-found under a new ID) can send RECOVER for this ID.
+                    if (fallLatched[i] == 1 && lastFallState[i] == 1)
+                    {
+                        int slot = 0;
+                        for (s = 0; s < FALLDET_MAX_SPOTS; s++)
+                        {
+                            if (fallenSpot[s].framesLeft < fallenSpot[slot].framesLeft)
+                            {
+                                slot = s; // a free slot (0) or else the oldest one
+                            }
+                        }
+                        fallenSpot[slot].xcm = lastXcm[i];
+                        fallenSpot[slot].ycm = lastYcm[i];
+                        fallenSpot[slot].reportId = reportId;
+                        fallenSpot[slot].framesLeft = FALLDET_SPOT_KEEP_FRAMES;
+                    }
+
                     activeTargets[i] = 0; // Remove from our historical state
 
                     // Reset fall states so it's clean if the ID is reused
                     fallLatched[i] = 0;
                     lastFallState[i] = 0;
                     fallFrameCounter[i] = 0;
+                    aliasOf[i] = 0;
 
                     sprintf(uartMsgBuf, "EXIT:%d\r\n", i);
                     UART_write(uartHandle, (uint8_t*)uartMsgBuf, strlen(uartMsgBuf));
