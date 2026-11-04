@@ -65,7 +65,13 @@ static int alert_received(const struct bt_mesh_model *model, struct bt_mesh_msg_
 
     uint8_t event_type = net_buf_simple_pull_u8(buf);
     uint8_t target_id = net_buf_simple_pull_u8(buf);
-    (void)net_buf_simple_pull_u8(buf); // reserved
+    uint8_t extra = net_buf_simple_pull_u8(buf); // reserved; heartbeat count for 0x07
+
+    if (event_type == 0x07) { // STATUS_HEARTBEAT in main.cpp
+        printk("Mesh Received <- Heartbeat #%u from node 0x%04X (RSSI %d)\r\n",
+               extra, ctx->addr, ctx->recv_rssi);
+        return 0;
+    }
 
     printk("Mesh Received <- Event: 0x%02X | Target ID: %d | from node 0x%04X (RSSI %d)\r\n",
            event_type, target_id, ctx->addr, ctx->recv_rssi);

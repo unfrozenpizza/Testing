@@ -99,7 +99,8 @@ typedef enum {
     RADAR_EVENT_FALL     = 0x03,
     RADAR_EVENT_RECOVERY = 0x04,
     AUDIO_EVENT_DROP     = 0x05, // New: Heavy object drop
-    AUDIO_EVENT_HELP     = 0x06  // New: "Help" keyword spoken
+    AUDIO_EVENT_HELP     = 0x06, // New: "Help" keyword spoken
+    STATUS_HEARTBEAT     = 0x07  // "I'm alive", every HEARTBEAT_INTERVAL_MS (not an alert)
 } radar_event_t;
 
 struct __attribute__((__packed__)) radar_payload {
@@ -256,6 +257,13 @@ K_MSGQ_DEFINE(ble_event_q, sizeof(struct radar_payload), 16, 1);
 #define BLE_PENDING_MAX   16
 #define BLE_RETRY_MS      1000
 
+// Heartbeat: 07 FF <count>, sent every HEARTBEAT_INTERVAL_MS so the receiver can tell a
+// working sensor from a dead/unplugged one (no heartbeat for ~2 intervals = sensor down).
+// <count> goes up by 1 each time (wraps 255 -> 0), so a gap shows missed heartbeats.
+// Heartbeats are never held: if nobody is subscribed, or mesh buffers are busy, that one is
+// skipped. Holding them would fill the pending rings and push out real alerts.
+#define HEARTBEAT_INTERVAL_MS 60000
+
 struct alert_ring {
     const char *name;
     struct radar_payload items[BLE_PENDING_MAX];
@@ -293,7 +301,9 @@ static void ring_pop(struct alert_ring *r) {
 }
 
 static void log_sent(const char *transport, const struct radar_payload *evt) {
-    if (evt->event_type >= AUDIO_EVENT_DROP) {
+    if (evt->event_type == STATUS_HEARTBEAT) {
+        printk("%s Sent -> Heartbeat #%u\r\n", transport, evt->reserved);
+    } else if (evt->event_type >= AUDIO_EVENT_DROP) {
         printk("%s Sent -> Acoustic Event: 0x%02X\r\n", transport, evt->event_type);
     } else {
         printk("%s Sent -> Radar Event: 0x%02X | Target ID: %d\r\n", transport, evt->event_type, evt->target_id);
@@ -352,10 +362,45 @@ static void mesh_flush_pending(void) {
     }
 }
 
+// Sends one heartbeat on each transport, once, with no retry (see HEARTBEAT_INTERVAL_MS).
+// Skipped on a transport that still has alerts held, so a heartbeat never goes out ahead of
+// an older alert.
+static void send_heartbeat(uint8_t count) {
+    struct radar_payload hb = {
+        .event_type = STATUS_HEARTBEAT,
+        .target_id = 0xFF,
+        .reserved = count,
+    };
+
+    if (mesh_pending.count == 0 && mesh_alerts_ready() &&
+        mesh_alerts_send((const uint8_t *)&hb, sizeof(hb)) == 0) {
+        log_sent("Mesh", &hb);
+    }
+
+    if (gatt_pending.count == 0) {
+        k_mutex_lock(&ble_conn_lock, K_FOREVER);
+        struct bt_conn *conn = ble_conn ? bt_conn_ref(ble_conn) : NULL;
+        k_mutex_unlock(&ble_conn_lock);
+
+        if (conn) {
+            if (bt_gatt_is_subscribed(conn, &radar_svc.attrs[2], BT_GATT_CCC_NOTIFY)) {
+                current_data = hb;
+                if (bt_gatt_notify(conn, &radar_svc.attrs[2], &current_data, sizeof(current_data)) == 0) {
+                    log_sent("BLE", &hb);
+                }
+            }
+            bt_conn_unref(conn);
+        }
+    }
+}
+
 void ble_sender_thread(void *p1, void *p2, void *p3) {
     struct radar_payload evt;
+    uint8_t heartbeat_count = 0;
 
     init_bluetooth();
+
+    int64_t next_heartbeat = k_uptime_get() + HEARTBEAT_INTERVAL_MS;
 
     while (1) {
         while (k_msgq_get(&ble_event_q, &evt, K_NO_WAIT) == 0) {
@@ -365,6 +410,12 @@ void ble_sender_thread(void *p1, void *p2, void *p3) {
 
         mesh_flush_pending();
         gatt_flush_pending();
+
+        // The loop wakes at least every BLE_RETRY_MS, so this fires within ~1 s of the due time.
+        if (k_uptime_get() >= next_heartbeat) {
+            send_heartbeat(heartbeat_count++);
+            next_heartbeat += HEARTBEAT_INTERVAL_MS;
+        }
 
         // Sleep until a new event, a receiver subscribing, or BLE_RETRY_MS (retry held alerts).
         struct k_poll_event events[] = {
