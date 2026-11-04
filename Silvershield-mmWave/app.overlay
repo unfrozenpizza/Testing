@@ -52,3 +52,9 @@
     pinctrl-1 = <&pdm0_sleep>;
     pinctrl-names = "default", "sleep";
 };
+
+/* Board enables i2c1 (Arduino I2C) at the same peripheral address as uart1 (instance 1);
+ * only one can be used, and uart1 is the radar link. */
+&i2c1 {
+    status = "disabled";
+};

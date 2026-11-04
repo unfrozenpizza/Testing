@@ -5,14 +5,18 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/audio/dmic.h> // Required for digital microphone
 #include <nrfx_pdm.h> // Direct HAL access for runtime PDM gain control
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <math.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <zephyr/sys/atomic.h>
+#include "mesh_alerts.h"
 #include "model-parameters/model_metadata.h"
 #ifdef ROUND_UP
 #undef ROUND_UP
@@ -20,18 +24,19 @@
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h" //change file name IF different and if i want to change AI model
 
 // =========================================================================
-// PROJECT DEFINES 
+// PROJECT DEFINES
 // =========================================================================
 #define UART_NODE DT_NODELABEL(uart1)
 #define MSG_BUFFER_SIZE 128
-#define MAX_TARGET_IDS 20
-static bool active_targets[MAX_TARGET_IDS];
+#define RADAR_MAX_TARGET_ID 254 // radar sends 0..255; 0xFF is reserved for audio events
+#define RADAR_ECHO_LINES    0   // 1 = print every raw radar line ("RAW UART: ...")
 
 // Radar UART receive: the interrupt copies bytes in as they arrive, main() reads them out.
 // Polling with a 1ms sleep dropped bytes at 921600 baud.
 #define RADAR_RX_BUF_SIZE 256
 RING_BUF_DECLARE(radar_rx_rb, RADAR_RX_BUF_SIZE);
 K_SEM_DEFINE(radar_rx_sem, 0, 1);
+static atomic_t radar_rx_dropped; // bytes lost to a full ring buffer; reported from main()
 
 static void radar_uart_isr(const struct device *dev, void *user_data) {
     uint8_t buf[32];
@@ -41,8 +46,10 @@ static void radar_uart_isr(const struct device *dev, void *user_data) {
         if (len <= 0) {
             break;
         }
-        if (ring_buf_put(&radar_rx_rb, buf, len) < (uint32_t)len) {
-            printk("Radar UART: RX buffer full, bytes dropped\r\n");
+        uint32_t put = ring_buf_put(&radar_rx_rb, buf, len);
+        if (put < (uint32_t)len) {
+            // No printk here: blocking on the console inside the ISR only loses more bytes.
+            atomic_add(&radar_rx_dropped, (atomic_val_t)(len - put));
         }
     }
     k_sem_give(&radar_rx_sem);
@@ -53,14 +60,32 @@ static void radar_uart_isr(const struct device *dev, void *user_data) {
 // =========================================================================
 #define DMIC_NODE            DT_NODELABEL(pdm0)
 #define AUDIO_SAMPLE_RATE    16000
-#define AUDIO_BLOCK_SIZE     1024  // 512 samples @ 16-bit PCM
-#define AUDIO_BLOCK_COUNT    16 //Increased as system keeps crashing
-#define IMPACT_THRESHOLD     15000 // Lowered from 22000: with gain boost below, claps/thumps were too often falling under the old bar
-#define IMPACT_MIN_SAMPLES   40 // Require a sustained run of loud samples in a block, not a single glitch
+#define AUDIO_BLOCK_SIZE     1024  // bytes = 512 samples @ 16-bit PCM = 32ms per block
+#define AUDIO_BLOCK_SAMPLES  (AUDIO_BLOCK_SIZE / sizeof(int16_t))
+#define AUDIO_BLOCK_COUNT    16 // Driver queue is 8 deep (app.overlay), so 16 leaves headroom for the reader
+#define AUDIO_DISCARD_BLOCKS 30 // ~1s of audio ignored after every mic start/restart (startup pop + DC settling)
+#define DEBUG_PRINT_BLOCKS   94  // audio DEBUG line every 94 blocks (~3s); impacts/rejections always print
 
 // PDM gain register: 0x00-0x50, 0.5dB/step, 0x28 = 0dB (Zephyr's dmic API doesn't
-// expose this, so it's set directly via the nrfx HAL after the stream starts).
-#define PDM_GAIN_BOOSTED     0x40 // +12dB over default; raise toward 0x50 if claps still don't register
+// expose this, so it's set directly via the nrfx HAL after every stream start).
+// Was 0x40 (+12dB): ordinary speech near the mic then clipped at full scale and
+// tripped the impact detector. All impact thresholds below are for 0dB.
+#define PDM_GAIN             0x28
+
+// Impact (drop/fall) detector, evaluated per 32ms block after removing the block's DC offset.
+// Units are raw signed 16-bit PCM amplitude (full scale 32767).
+#define IMPACT_PEAK_THRESHOLD   5000  // Equivalent of the old 20000 at +12dB gain
+#define IMPACT_MIN_SAMPLES      80    // Samples above IMPACT_PEAK_THRESHOLD in the onset block (~5ms of loud audio)
+#define IMPACT_ONSET_RATIO      16.0f // Onset block energy must be >= 16x (+12dB) the background noise floor
+#define IMPACT_DECAY_RATIO      8.0f  // ...and must fall back below onset/8 (-9dB) within IMPACT_DECAY_BLOCKS,
+#define IMPACT_DECAY_BLOCKS     8     // i.e. ~256ms. Sustained loud sound (speech, TV, music) is not an impact.
+#define IMPACT_COOLDOWN_MS      2000
+#define NOISE_FLOOR_MIN_RMS     50.0f // Floor clamp so a dead-silent room doesn't make every tap an "onset"
+
+// Blocks that are not plausible audio are rejected outright (PDM glitch, DC step, stuck bitstream).
+#define CLIP_LEVEL              32000 // |raw sample| at or above this counts as clipped
+#define CLIP_REJECT_SAMPLES     ((int)AUDIO_BLOCK_SAMPLES / 2) // more than half the block pinned at full scale
+#define MIN_ZERO_CROSSINGS      4     // a real loud sound crosses zero many times per 32ms; a DC/rail block doesn't (loud blocks only)
 
 // Allocate memory for the audio stream
 K_MEM_SLAB_DEFINE(rx_mem_slab, AUDIO_BLOCK_SIZE, AUDIO_BLOCK_COUNT, 16);
@@ -80,9 +105,12 @@ typedef enum {
 struct __attribute__((__packed__)) radar_payload {
     uint8_t event_type;
     uint8_t target_id;
-    uint8_t reserved;  
+    uint8_t reserved;
 };
+// The mesh side (mesh_alerts.c) sends these same 3 bytes.
+static_assert(sizeof(struct radar_payload) == 3, "mesh_alerts.c expects a 3-byte payload");
 
+// Only the BLE sender thread touches this (it's also the characteristic's backing value).
 static struct radar_payload current_data;
 
 
@@ -98,9 +126,14 @@ static struct radar_payload current_data;
 static struct bt_uuid_128 radar_service_uuid = BT_UUID_INIT_128(BT_UUID_RADAR_SERVICE_VAL);
 static struct bt_uuid_128 radar_chrc_uuid = BT_UUID_INIT_128(BT_UUID_RADAR_CHRC_VAL);
 
+K_SEM_DEFINE(ble_flush_sem, 0, 1); // wakes the BLE sender to re-send held alerts
+
 static void radar_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value) {
     bool notif_enabled = (value == BT_GATT_CCC_NOTIFY);
     printk("BLE Notifications: %s\r\n", notif_enabled ? "ENABLED" : "DISABLED");
+    if (notif_enabled) {
+        k_sem_give(&ble_flush_sem);
+    }
 }
 
 BT_GATT_SERVICE_DEFINE(radar_svc,
@@ -125,72 +158,264 @@ static const struct bt_data sd[] = {
     BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_RADAR_SERVICE_VAL),
 };
 
-int init_bluetooth(void) {
-    int err;
+// The receiver's connection (NULL when nobody is connected). Set/cleared from the BT callbacks,
+// read by the BLE sender thread.
+static struct bt_conn *ble_conn;
+K_MUTEX_DEFINE(ble_conn_lock);
 
-    // Initialize the Bluetooth subsystem
-    err = bt_enable(NULL);
+static void start_advertising(void) {
+    int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err == 0) {
+        printk("Bluetooth advertising started\r\n");
+    } else if (err != -EALREADY) {
+        printk("Advertising failed to start (err %d)\r\n", err);
+    }
+}
+
+static void adv_work_handler(struct k_work *work) {
+    start_advertising();
+}
+K_WORK_DEFINE(adv_work, adv_work_handler);
+
+static void ble_connected(struct bt_conn *conn, uint8_t err) {
     if (err) {
-        printk("Bluetooth init failed (err %d)\n", err);
-        return err;
+        printk("BLE connection failed (err 0x%02X)\r\n", err);
+        return;
+    }
+    printk("BLE connected\r\n");
+    k_mutex_lock(&ble_conn_lock, K_FOREVER);
+    if (!ble_conn) {
+        ble_conn = bt_conn_ref(conn);
+    }
+    k_mutex_unlock(&ble_conn_lock);
+}
+
+static void ble_disconnected(struct bt_conn *conn, uint8_t reason) {
+    printk("BLE disconnected (reason 0x%02X)\r\n", reason);
+    k_mutex_lock(&ble_conn_lock, K_FOREVER);
+    if (ble_conn == conn) {
+        bt_conn_unref(ble_conn);
+        ble_conn = NULL;
+    }
+    k_mutex_unlock(&ble_conn_lock);
+}
+
+// Connectable advertising stops when a connection is made and does not restart on its own.
+// Once the connection object is freed after a disconnect, advertise again so the receiver
+// can reconnect (otherwise the device is invisible until reboot).
+static void ble_recycled(void) {
+    k_work_submit(&adv_work);
+}
+
+BT_CONN_CB_DEFINE(ble_conn_callbacks) = {
+    .connected = ble_connected,
+    .disconnected = ble_disconnected,
+    .recycled = ble_recycled,
+};
+
+// Retries until the Bluetooth stack is up and advertising; never gives up, so a transient
+// failure (e.g. network core slow to boot) doesn't leave the device permanently offline.
+static void init_bluetooth(void) {
+    int delay_ms = 1000;
+
+    while (1) {
+        int err = bt_enable(NULL);
+        if (err == 0 || err == -EALREADY) {
+            break;
+        }
+        printk("Bluetooth init failed (err %d), retrying in %d ms\r\n", err, delay_ms);
+        k_msleep(delay_ms);
+        delay_ms = MIN(delay_ms * 2, 30000);
     }
 
-    // Define your advertising data (keep your existing ad/sd arrays here)
-    // ...
-
-    // Start advertising using Zephyr's built-in connectable parameter macro
-    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-    if (err) {
-        printk("Advertising failed to start (err %d)\n", err);
-        return err;
+    // Mesh has to be set up before the saved settings are loaded, so it can restore its
+    // network keys. If mesh fails, the direct GATT link below still works.
+    int mesh_err = mesh_alerts_init();
+    settings_load();
+    if (mesh_err == 0) {
+        mesh_alerts_start();
     }
 
-    printk("Bluetooth advertising started successfully\n");
-    return 0;
+    start_advertising();
+    printk("Bluetooth active. Advertising as: '%s'\r\n", CONFIG_BT_DEVICE_NAME);
 }
 
 
 // =========================================================================
 // PHASE 5: BLE NOTIFICATION TRANSMISSION
 // =========================================================================
+// The radar (main), audio and AI threads all raise events. They only drop the event
+// into this queue (never blocks); one sender thread owns current_data and calls
+// bt_gatt_notify, so the audio thread can't stall waiting on a BLE buffer and two
+// events can't overwrite each other's payload.
+K_MSGQ_DEFINE(ble_event_q, sizeof(struct radar_payload), 16, 1);
+
+// Alerts that couldn't be delivered yet are held in a ring per transport and re-sent later.
+// GATT holds them until a receiver connects and subscribes; mesh holds them only while its
+// send buffers are busy (or mesh isn't up yet). When a ring is full, its oldest alert is dropped.
+#define BLE_PENDING_MAX   16
+#define BLE_RETRY_MS      1000
+
+struct alert_ring {
+    const char *name;
+    struct radar_payload items[BLE_PENDING_MAX];
+    size_t head, count;
+};
+static struct alert_ring gatt_pending = { .name = "BLE" };
+static struct alert_ring mesh_pending = { .name = "Mesh" };
+
 void send_radar_ble_notification(radar_event_t event, uint8_t target_id) {
-    current_data.event_type = event;
-    current_data.target_id = target_id;
-    current_data.reserved = 0x00;
+    struct radar_payload evt = {
+        .event_type = (uint8_t)event,
+        .target_id = target_id,
+        .reserved = 0x00,
+    };
 
-    int err = bt_gatt_notify(NULL, &radar_svc.attrs[2], &current_data, sizeof(current_data));
-
-    if (err == -11 || err == -EAGAIN) {
-        // BLE buffer full: Do nothing silently. 
-        // This prevents slow printk spam from locking up the mic thread.
-    } else if (err) {
-        printk("BLE Notification failed (err %d)\r\n", err);
-    } else {
-        if (event >= AUDIO_EVENT_DROP) {
-            printk("BLE Sent -> Acoustic Event: 0x%02X\r\n", event);
-        } else {
-            printk("BLE Sent -> Radar Event: 0x%02X | Target ID: %d\r\n", event, target_id);
-        }
+    if (k_msgq_put(&ble_event_q, &evt, K_NO_WAIT) != 0) {
+        printk("BLE event queue full, event 0x%02X dropped\r\n", event);
     }
 }
+
+static void ring_push(struct alert_ring *r, const struct radar_payload *evt) {
+    if (r->count == BLE_PENDING_MAX) {
+        printk("%s: pending alerts full, oldest (0x%02X) dropped\r\n",
+               r->name, r->items[r->head].event_type);
+        r->head = (r->head + 1) % BLE_PENDING_MAX;
+        r->count--;
+    }
+    r->items[(r->head + r->count) % BLE_PENDING_MAX] = *evt;
+    r->count++;
+}
+
+static void ring_pop(struct alert_ring *r) {
+    r->head = (r->head + 1) % BLE_PENDING_MAX;
+    r->count--;
+}
+
+static void log_sent(const char *transport, const struct radar_payload *evt) {
+    if (evt->event_type >= AUDIO_EVENT_DROP) {
+        printk("%s Sent -> Acoustic Event: 0x%02X\r\n", transport, evt->event_type);
+    } else {
+        printk("%s Sent -> Radar Event: 0x%02X | Target ID: %d\r\n", transport, evt->event_type, evt->target_id);
+    }
+}
+
+// Sends held alerts in order while a subscribed receiver is connected. Stops at the first
+// failure and leaves the rest held for the next attempt.
+static void gatt_flush_pending(void) {
+    while (gatt_pending.count > 0) {
+        k_mutex_lock(&ble_conn_lock, K_FOREVER);
+        struct bt_conn *conn = ble_conn ? bt_conn_ref(ble_conn) : NULL;
+        k_mutex_unlock(&ble_conn_lock);
+
+        if (!conn) {
+            return;
+        }
+        if (!bt_gatt_is_subscribed(conn, &radar_svc.attrs[2], BT_GATT_CCC_NOTIFY)) {
+            bt_conn_unref(conn);
+            return;
+        }
+
+        struct radar_payload evt = gatt_pending.items[gatt_pending.head];
+        current_data = evt;
+        int err = bt_gatt_notify(conn, &radar_svc.attrs[2], &current_data, sizeof(current_data));
+        bt_conn_unref(conn);
+
+        if (err) {
+            if (err != -EAGAIN && err != -ENOMEM) {
+                printk("BLE Notification failed (err %d), will retry\r\n", err);
+            }
+            return;
+        }
+
+        ring_pop(&gatt_pending);
+        log_sent("BLE", &evt);
+    }
+}
+
+// Publishes held alerts to the mesh in order. Mesh is a broadcast, so there is no receiver
+// to wait for; an alert only stays held while mesh isn't up or its buffers are full.
+static void mesh_flush_pending(void) {
+    while (mesh_pending.count > 0 && mesh_alerts_ready()) {
+        struct radar_payload evt = mesh_pending.items[mesh_pending.head];
+        int err = mesh_alerts_send((const uint8_t *)&evt, sizeof(evt));
+
+        if (err) {
+            if (err != -ENOBUFS && err != -EBUSY) {
+                printk("Mesh send failed (err %d), will retry\r\n", err);
+            }
+            return;
+        }
+
+        ring_pop(&mesh_pending);
+        log_sent("Mesh", &evt);
+    }
+}
+
+void ble_sender_thread(void *p1, void *p2, void *p3) {
+    struct radar_payload evt;
+
+    init_bluetooth();
+
+    while (1) {
+        while (k_msgq_get(&ble_event_q, &evt, K_NO_WAIT) == 0) {
+            ring_push(&gatt_pending, &evt);
+            ring_push(&mesh_pending, &evt);
+        }
+
+        mesh_flush_pending();
+        gatt_flush_pending();
+
+        // Sleep until a new event, a receiver subscribing, or BLE_RETRY_MS (retry held alerts).
+        struct k_poll_event events[] = {
+            K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY, &ble_event_q),
+            K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY, &ble_flush_sem),
+        };
+        k_poll(events, ARRAY_SIZE(events), K_MSEC(BLE_RETRY_MS));
+        k_sem_take(&ble_flush_sem, K_NO_WAIT);
+    }
+}
+
+// Priority 8: below the audio thread (7) so it never delays mic reads, above the AI thread (10)
+// so an alert isn't held up behind an inference.
+// 4096: this thread also runs bt_enable(), mesh setup and settings_load() at startup.
+K_THREAD_DEFINE(ble_sender_id, 4096, ble_sender_thread, NULL, NULL, NULL, 8, 0, 0);
 
 // =========================================================================
 // RADAR PARSER
 // =========================================================================
+// The radar sends exactly one "<KEYWORD>:<id>" per line (mss_main.c). Only a keyword at the
+// start of the line followed by a plain decimal id in 0..RADAR_MAX_TARGET_ID is accepted, so
+// other text on the logger UART (or a fragment of it) can't be mistaken for an event.
 void parse_radar_line(const char *line) {
-    int parsed_id = 0;
+    static const struct {
+        const char *keyword;
+        radar_event_t event;
+    } radar_keywords[] = {
+        { "ENTRY:",   RADAR_EVENT_ENTRY },
+        { "EXIT:",    RADAR_EVENT_EXIT },
+        { "FALL:",    RADAR_EVENT_FALL },
+        { "RECOVER:", RADAR_EVENT_RECOVERY },
+    };
 
-    if (strstr(line, "ENTRY:") && sscanf(strstr(line, "ENTRY:"), "ENTRY:%d", &parsed_id) == 1) {
-        send_radar_ble_notification(RADAR_EVENT_ENTRY, parsed_id);
-    }
-    if (strstr(line, "EXIT:") && sscanf(strstr(line, "EXIT:"), "EXIT:%d", &parsed_id) == 1) {
-        send_radar_ble_notification(RADAR_EVENT_EXIT, parsed_id);
-    }
-    if (strstr(line, "FALL:") && sscanf(strstr(line, "FALL:"), "FALL:%d", &parsed_id) == 1) {
-        send_radar_ble_notification(RADAR_EVENT_FALL, parsed_id);
-    }
-    if (strstr(line, "RECOVER:") && sscanf(strstr(line, "RECOVER:"), "RECOVER:%d", &parsed_id) == 1) {
-        send_radar_ble_notification(RADAR_EVENT_RECOVERY, parsed_id);
+    for (size_t k = 0; k < ARRAY_SIZE(radar_keywords); k++) {
+        size_t kw_len = strlen(radar_keywords[k].keyword);
+        if (strncmp(line, radar_keywords[k].keyword, kw_len) != 0) {
+            continue;
+        }
+
+        const char *num = line + kw_len;
+        char *end;
+        long id = strtol(num, &end, 10);
+        while (*end == ' ') {
+            end++;
+        }
+        if (end == num || *end != '\0' || id < 0 || id > RADAR_MAX_TARGET_ID) {
+            printk("Radar: ignored malformed line '%s'\r\n", line);
+            return;
+        }
+        send_radar_ble_notification(radar_keywords[k].event, (uint8_t)id);
+        return;
     }
 }
 
@@ -198,29 +423,53 @@ void parse_radar_line(const char *line) {
 // NEW: ACOUSTIC BACKGROUND THREAD
 // =========================================================================
 
-static float ai_audio_buffer[EI_CLASSIFIER_SLICE_SIZE];
-static float ai_inference_buffer[EI_CLASSIFIER_SLICE_SIZE];
-K_SEM_DEFINE(ai_run_sem, 0, 1);
-// 2. Edge Impulse reads from the isolated inference buffer
+// Audio -> AI hand-off. The audio thread fills one 250ms slice (EI_CLASSIFIER_SLICE_SIZE samples)
+// at a time and queues its index; the AI thread reads that slice while the audio thread fills the
+// next one. With AI_SLICE_QUEUE_LEN queued + 1 being read + 1 being filled, AI_SLICE_BUFFERS
+// guarantees the slice being written is never one the AI thread can still be reading.
+#define AI_SLICE_QUEUE_LEN 2
+#define AI_SLICE_BUFFERS   (AI_SLICE_QUEUE_LEN + 2)
+#define HELP_CONFIDENCE    0.80f
+#define HELP_COOLDOWN_MS   1000
+#define AI_PRINT_EVERY     12 // print scores every 12th inference (~3s)...
+#define HELP_PRINT_SCORE   0.50f // ...or immediately whenever "help" scores at least this
+
+static int16_t ai_slices[AI_SLICE_BUFFERS][EI_CLASSIFIER_SLICE_SIZE];
+static const int16_t *ai_current_slice;
+K_MSGQ_DEFINE(ai_slice_q, sizeof(uint8_t), AI_SLICE_QUEUE_LEN, 1);
+static atomic_t ai_dropped_slices;
+static atomic_t ai_reset_requested;
+
+// Edge Impulse reads the slice currently being classified (raw int16 values cast to float,
+// which is the scale the model was trained on).
 int get_audio_data(size_t offset, size_t length, float *out_ptr) {
     for (size_t i = 0; i < length; i++) {
-        out_ptr[i] = ai_inference_buffer[offset + i];
+        out_ptr[i] = (float)ai_current_slice[offset + i];
     }
     return 0;
 }
-// 3. Background thread execution: feeds 250ms slices into run_classifier_continuous(),
-// which keeps a sliding 1s window internally (EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW = 4),
-// so a word is classified against multiple overlapping windows instead of only whichever
-// single non-overlapping 1s chunk it happened to land in.
+
+// Feeds 250ms slices into run_classifier_continuous(), which keeps a sliding 1s window internally
+// (EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW = 4), so a word is classified against multiple
+// overlapping windows instead of only whichever single 1s chunk it happened to land in.
 void ai_processing_thread(void *p1, void *p2, void *p3) {
-    static int ai_print_counter = 0; // NEW: Throttles AI logs
+    static int ai_print_counter = 0; // Throttles AI logs
+    int64_t last_help_time = 0;
+    uint8_t slice_idx;
 
     // Must be called once before any run_classifier_continuous() calls to reset the SDK's
     // internal sliding feature-matrix state.
     run_classifier_init();
 
-    while(1) {
-        k_sem_take(&ai_run_sem, K_FOREVER);
+    while (1) {
+        k_msgq_get(&ai_slice_q, &slice_idx, K_FOREVER);
+
+        // After a mic restart the slices are no longer contiguous; start a fresh window.
+        if (atomic_clear(&ai_reset_requested)) {
+            run_classifier_init();
+        }
+
+        ai_current_slice = ai_slices[slice_idx];
 
         signal_t signal;
         signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
@@ -234,23 +483,32 @@ void ai_processing_thread(void *p1, void *p2, void *p3) {
             continue;
         }
 
-        // Only print AI scores every 5th inference cycle to stop log spam
-        if (++ai_print_counter >= 3) {
-            for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-                const char *label = result.classification[ix].label;
-                float val = result.classification[ix].value;
-                printk("   %s: %.5f\n", label, (double)val);
+        // Only print AI scores every AI_PRINT_EVERY inferences to stop log spam, but always
+        // print when "help" scores at least HELP_PRINT_SCORE so near-misses stay visible.
+        bool help_near_miss = false;
+        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+            if (strcmp(result.classification[ix].label, "help") == 0 &&
+                result.classification[ix].value >= HELP_PRINT_SCORE) {
+                help_near_miss = true;
             }
+        }
+        if (++ai_print_counter >= AI_PRINT_EVERY || help_near_miss) {
+            // One line, e.g. "AI - help: 0.004 noise: 0.992 unknown: 0.000"
+            printk("AI -");
+            for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+                printk(" %s: %.3f", result.classification[ix].label,
+                       (double)result.classification[ix].value);
+            }
+            printk("\r\n");
             ai_print_counter = 0;
         }
-        
-        // Trigger BLE alert on "help" (keeps checking every time even if print is throttled).
+
+        // Trigger BLE alert on "help" (checked every inference even if printing is throttled).
         // A single utterance spans several overlapping 250ms windows, so debounce with a
-        // cooldown the same way the impact detector does, or one "help" fires repeatedly.
-        static int64_t last_help_time = 0;
-        const int64_t HELP_COOLDOWN_MS = 1000;
+        // cooldown, or one "help" fires repeatedly.
         for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-            if (strcmp(result.classification[ix].label, "help") == 0 && result.classification[ix].value > 0.80) {
+            if (strcmp(result.classification[ix].label, "help") == 0 &&
+                result.classification[ix].value > HELP_CONFIDENCE) {
                 int64_t now = k_uptime_get();
                 if (now - last_help_time > HELP_COOLDOWN_MS) {
                     printk("[Acoustic] Voice Command: 'HELP' detected! (conf: %.2f, t=%lldms)\r\n",
@@ -263,34 +521,100 @@ void ai_processing_thread(void *p1, void *p2, void *p3) {
     }
 }
 
-// AI Thread Priority 10 (Lower than Audio Thread Priority 7, allowing audio to interrupt AI)
+// AI Thread Priority 10 (lower than the audio thread's 7, so audio always preempts inference)
 K_THREAD_DEFINE(ai_thread_id, 8192, ai_processing_thread, NULL, NULL, NULL, 10, 0, 0);
 
-void feed_ai_buffer(int16_t *samples, size_t count) {
-    static size_t sample_index = 0;
+static uint8_t ai_fill_idx;
+static size_t ai_fill_count;
 
-    for(size_t i = 0; i < count; i++) {
-        if (sample_index < EI_CLASSIFIER_SLICE_SIZE) {
-            ai_audio_buffer[sample_index++] = (float)samples[i];
+// Copies every sample into the current slice; a block that completes a slice carries its
+// leftover samples into the next one, so no audio is lost between slices.
+void feed_ai_buffer(const int16_t *samples, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        ai_slices[ai_fill_idx][ai_fill_count++] = samples[i];
+
+        if (ai_fill_count == EI_CLASSIFIER_SLICE_SIZE) {
+            ai_fill_count = 0;
+            if (k_msgq_put(&ai_slice_q, &ai_fill_idx, K_NO_WAIT) == 0) {
+                ai_fill_idx = (ai_fill_idx + 1) % AI_SLICE_BUFFERS;
+            } else {
+                // AI thread is behind: reuse this buffer and tell the classifier the
+                // stream has a gap.
+                atomic_inc(&ai_dropped_slices);
+                atomic_set(&ai_reset_requested, 1);
+            }
         }
     }
-
-    if (sample_index >= EI_CLASSIFIER_SLICE_SIZE) {
-        // 1. Copy the live 250ms slice into the isolated inference buffer so the AI can read it
-        memcpy(ai_inference_buffer, ai_audio_buffer, sizeof(ai_audio_buffer));
-
-        // 2. Wake up the background AI thread so the mic doesn't stall
-        k_sem_give(&ai_run_sem);
-
-        // 3. Reset index for the next slice
-        sample_index = 0;
-    }
 }
+
+// Discard any partial slice and restart the classifier window (after a mic restart).
+static void reset_ai_feed(void) {
+    ai_fill_count = 0;
+    atomic_set(&ai_reset_requested, 1);
+}
+
+static void apply_pdm_gain(void) {
+    nrf_pdm_gain_set(NRF_PDM0, PDM_GAIN, PDM_GAIN);
+}
+
+struct block_stats {
+    int32_t dc;            // block mean (raw)
+    int16_t min_raw;
+    int16_t max_raw;
+    int32_t peak;          // max |x - dc|
+    float rms;             // RMS of x - dc
+    int over_threshold;    // samples with |x - dc| > IMPACT_PEAK_THRESHOLD
+    int clipped;           // samples with |x| >= CLIP_LEVEL
+    int zero_crossings;    // sign changes of x - dc
+};
+
+static void analyze_block(const int16_t *pcm, size_t n, struct block_stats *s) {
+    int64_t sum = 0;
+    int16_t mn = INT16_MAX, mx = INT16_MIN;
+    int clipped = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        int16_t v = pcm[i];
+        sum += v;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        // int32 so that -32768 doesn't overflow back to negative in abs()
+        if (abs((int32_t)v) >= CLIP_LEVEL) clipped++;
+    }
+
+    int32_t dc = (int32_t)(sum / (int64_t)n);
+    int64_t sum_sq = 0;
+    int32_t peak = 0;
+    int over = 0, zc = 0;
+    bool prev_neg = (pcm[0] - dc) < 0;
+
+    for (size_t i = 0; i < n; i++) {
+        int32_t v = (int32_t)pcm[i] - dc;
+        int32_t a = abs(v);
+        if (a > peak) peak = a;
+        if (a > IMPACT_PEAK_THRESHOLD) over++;
+        sum_sq += (int64_t)v * v;
+        bool neg = v < 0;
+        if (neg != prev_neg) zc++;
+        prev_neg = neg;
+    }
+
+    s->dc = dc;
+    s->min_raw = mn;
+    s->max_raw = mx;
+    s->peak = peak;
+    s->rms = sqrtf((float)sum_sq / (float)n);
+    s->over_threshold = over;
+    s->clipped = clipped;
+    s->zero_crossings = zc;
+}
+
 void audio_processing_thread(void *p1, void *p2, void *p3) {
     const struct device *mic_dev = DEVICE_DT_GET(DMIC_NODE);
     void *buffer;
     size_t size;
-    int startup_delay = 10; // NEW: Number of audio blocks to ignore on boot
+    int discard_blocks = AUDIO_DISCARD_BLOCKS; // Blocks to ignore after every mic start
+    uint32_t mic_restarts = 0;
 
     if (!device_is_ready(mic_dev)) {
         printk("Audio Error: Microphone not ready. Acoustic thread stopping.\r\n");
@@ -306,7 +630,7 @@ void audio_processing_thread(void *p1, void *p2, void *p3) {
 
     struct dmic_cfg cfg;
     memset(&cfg, 0, sizeof(cfg)); // Clear memory first to be safe
-    
+
     // 1. IO configuration
     cfg.io.min_pdm_clk_freq = 1000000;
     cfg.io.max_pdm_clk_freq = 3500000;
@@ -320,7 +644,7 @@ void audio_processing_thread(void *p1, void *p2, void *p3) {
     cfg.channel.req_num_streams = 1;
     cfg.channel.req_num_chan = 1;
     cfg.channel.req_chan_map_lo = dmic_build_channel_map(0, 0, PDM_CHAN_LEFT);
-    
+
     int err = dmic_configure(mic_dev, &cfg);
     if (err) {
         printk("Audio Error: Configuration rejected (err %d). Check parameters or pins.\r\n", err);
@@ -332,131 +656,144 @@ void audio_processing_thread(void *p1, void *p2, void *p3) {
         printk("Audio Error: Hardware failed to trigger (err %d).\r\n", err);
         return;
     }
-
-    nrf_pdm_gain_set(NRF_PDM0, PDM_GAIN_BOOSTED, PDM_GAIN_BOOSTED);
+    apply_pdm_gain();
 
     printk("Acoustic Subsystem Active. Listening for events...\r\n");
 
-    int loop_counter = 0;
-    
-    // Variables to track cooldowns
-    int64_t last_event_time = 0;
-    const int64_t COOLDOWN_MS = 2000; // 2 seconds
+    // Impact detector state
+    float noise_floor_rms = 0.0f;   // slow average of background level; 0 = not yet measured
+    int impact_blocks_left = 0;     // >0 while waiting for a candidate impact to decay
+    float impact_onset_rms = 0.0f;
+    struct block_stats impact_onset = { 0 };
+    int64_t last_event_time = -IMPACT_COOLDOWN_MS;
+    uint32_t rejected_blocks = 0;
+    int print_delay = 0;
 
     while (1) {
         int read_result = dmic_read(mic_dev, 0, &buffer, &size, 500);
 
-        if (read_result == 0) {
-            loop_counter++;
-            
-            if (startup_delay > 0) {
-                startup_delay--;
-                k_mem_slab_free(&rx_mem_slab, buffer);
-                continue; 
-            }
+        if (read_result != 0) {
+            // -EAGAIN (timeout) or any other error means the PDM stream stopped delivering blocks
+            // (e.g. the driver ran out of slab buffers and stopped itself).
+            mic_restarts++;
+            printk("\n[Acoustic] Mic stream stall/error (%d), restart #%u\r\n", read_result, mic_restarts);
 
-            int16_t *pcm_samples = (int16_t *)buffer;
-            size_t num_samples = size / sizeof(int16_t);
-            bool peak_detected = false;
-            int16_t max_volume_in_buffer = 0;
-            int samples_over_threshold = 0;
-            static int print_delay = 0;
-
-            for (size_t i = 0; i < num_samples; i++) {
-                int16_t current_val = abs(pcm_samples[i]);
-                if (current_val > max_volume_in_buffer) {
-                    max_volume_in_buffer = current_val;
-                }
-                if (current_val > IMPACT_THRESHOLD) {
-                    samples_over_threshold++;
-                }
-            }
-
-            // A real impact drives many samples over threshold within a single ~32ms block;
-            // a single electrical/RF glitch corrupts only one or two samples. Fires immediately
-            // within the block it happens in, since a fall's impact sound is a brief transient
-            // that may not persist into a second block.
-            if (samples_over_threshold >= IMPACT_MIN_SAMPLES) {
-                peak_detected = true;
-            }
-
-            print_delay++;
-            if (print_delay >= 30) {
-                printk("DEBUG - Live Peak Volume: %d\r\n", max_volume_in_buffer);
-                print_delay = 0;
-            }
-
-            // Non-blocking cooldown logic
-            int64_t now = k_uptime_get(); // Get current system time in milliseconds
-
-            if (peak_detected && (now - last_event_time > COOLDOWN_MS)) {
-                printk("[Acoustic] Heavy impact/drop detected! (Peak: %d, t=%lldms)\r\n", max_volume_in_buffer, now);
-                send_radar_ble_notification(AUDIO_EVENT_DROP, 0xFF); 
-                
-                last_event_time = now; // Reset the cooldown timer
-            }
-
-            // Feed data to the AI. It will trigger the background thread automatically when full.
-            feed_ai_buffer(pcm_samples, num_samples);
-
-            // Memory is safely freed every single cycle
-            k_mem_slab_free(&rx_mem_slab, buffer);
-
-        } else {
-            // -11 (Timeout) or any other negative error means the DMA stalled
-            printk("\n[Acoustic] Stream stall/error (%d) detected during AI processing. Restarting mic...\r\n", read_result);
-            
-            // 1. Force stop the hardware
             dmic_trigger(mic_dev, DMIC_TRIGGER_STOP);
-            
-            // 2. Give the DMA a 10-millisecond breather to completely clear its registers
-            k_sleep(K_MSEC(10)); 
-            
-            // 3. Start the hardware back up
-            dmic_trigger(mic_dev, DMIC_TRIGGER_START);
-            
-            // 4. Ignore the first 10 frames to avoid the hardware startup "pop"
-            startup_delay = 10; 
-            
-            k_yield();
+            // The driver only finishes stopping at the end of the current 32ms block; a START
+            // before that is silently ignored, so wait well past one block.
+            k_sleep(K_MSEC(100));
+            err = dmic_trigger(mic_dev, DMIC_TRIGGER_START);
+            if (err) {
+                printk("[Acoustic] Mic restart failed (err %d)\r\n", err);
+            }
+            apply_pdm_gain();
+
+            discard_blocks = AUDIO_DISCARD_BLOCKS;
+            noise_floor_rms = 0.0f;
+            impact_blocks_left = 0;
+            reset_ai_feed();
+            continue;
         }
+
+        if (discard_blocks > 0) {
+            discard_blocks--;
+            k_mem_slab_free(&rx_mem_slab, buffer);
+            continue;
+        }
+
+        const int16_t *pcm_samples = (const int16_t *)buffer;
+        size_t num_samples = size / sizeof(int16_t);
+        struct block_stats st;
+        analyze_block(pcm_samples, num_samples, &st);
+
+        // Not plausible audio: mostly pinned at full scale, or a loud block with no oscillation
+        // (DC step / stuck bitstream). Quiet blocks are exempt from the zero-crossing check: room
+        // hum (~50Hz) only crosses zero ~3 times per 32ms and is perfectly normal.
+        bool invalid = (st.clipped > CLIP_REJECT_SAMPLES) ||
+                       (st.peak >= IMPACT_PEAK_THRESHOLD && st.zero_crossings < MIN_ZERO_CROSSINGS);
+        if (invalid && (++rejected_blocks <= 10 || rejected_blocks % 100 == 0)) { // rate-limited
+            printk("[Acoustic] Ignored invalid block #%u (clipped %d, zc %d, dc %d, min %d, max %d)\r\n",
+                   rejected_blocks, st.clipped, st.zero_crossings, st.dc, st.min_raw, st.max_raw);
+        }
+
+        int64_t now = k_uptime_get();
+        float floor_rms = MAX(noise_floor_rms, NOISE_FLOOR_MIN_RMS);
+
+        if (impact_blocks_left > 0) {
+            // Candidate impact: confirm it is a transient (dies away), not sustained sound.
+            // An invalid (clipped) block during the window counts as "still loud", so a long
+            // clipped sound followed by silence can't be mistaken for a decaying impact.
+            if (!invalid && st.rms * IMPACT_DECAY_RATIO <= impact_onset_rms) {
+                if (now - last_event_time > IMPACT_COOLDOWN_MS) {
+                    printk("[Acoustic] Heavy impact/drop detected! (Peak: %d, Over: %d, RMS: %d, Floor: %d, t=%lldms)\r\n",
+                           impact_onset.peak, impact_onset.over_threshold, (int)impact_onset_rms,
+                           (int)floor_rms, now);
+                    send_radar_ble_notification(AUDIO_EVENT_DROP, 0xFF);
+                    last_event_time = now;
+                }
+                impact_blocks_left = 0;
+            } else if (--impact_blocks_left == 0) {
+                printk("[Acoustic] Loud sound ignored: did not decay like an impact (Peak: %d, Over: %d)\r\n",
+                       impact_onset.peak, impact_onset.over_threshold);
+            }
+        } else if (!invalid &&
+                   noise_floor_rms > 0.0f &&
+                   st.peak >= IMPACT_PEAK_THRESHOLD &&
+                   st.over_threshold >= IMPACT_MIN_SAMPLES &&
+                   st.rms >= IMPACT_ONSET_RATIO * floor_rms) {
+            // Sharp onset from a quiet background: wait for it to decay before alerting.
+            impact_blocks_left = IMPACT_DECAY_BLOCKS;
+            impact_onset_rms = st.rms;
+            impact_onset = st;
+        }
+
+        // Track the background level only from valid blocks outside candidate events (~1s time constant).
+        if (!invalid && impact_blocks_left == 0) {
+            if (noise_floor_rms == 0.0f) {
+                noise_floor_rms = st.rms;
+            } else {
+                noise_floor_rms += (st.rms - noise_floor_rms) / 32.0f;
+            }
+        }
+
+        if (++print_delay >= DEBUG_PRINT_BLOCKS) {
+            printk("DEBUG - Peak: %d RMS: %d Floor: %d DC: %d Min: %d Max: %d ZC: %d | restarts %u, bad blocks %u, AI slices dropped %ld\r\n",
+                   st.peak, (int)st.rms, (int)noise_floor_rms, st.dc, st.min_raw, st.max_raw,
+                   st.zero_crossings, mic_restarts, rejected_blocks, (long)atomic_get(&ai_dropped_slices));
+            print_delay = 0;
+        }
+
+        // Feed every sample to the AI; it queues a slice for the AI thread each 250ms.
+        feed_ai_buffer(pcm_samples, num_samples);
+
+        k_mem_slab_free(&rx_mem_slab, buffer);
     }
 }
 
 // Automatically start the audio thread on boot
-K_THREAD_DEFINE(audio_thread, 32768, audio_processing_thread, NULL, NULL, NULL, 7, 0, 0);
+K_THREAD_DEFINE(audio_thread, 4096, audio_processing_thread, NULL, NULL, NULL, 7, 0, 0);
 
 // =========================================================================
 // MAIN ROUTINE (RADAR POLLING)
 // =========================================================================
 int main(void)
 {
-    k_msleep(500);
     const struct device *const uart_dev = DEVICE_DT_GET(UART_NODE);
     unsigned char rx_byte;
     char line_buffer[MSG_BUFFER_SIZE];
     int buf_idx = 0;
+    bool discarding = false; // dropping the rest of an over-long line
     int err;
 
-    if (!device_is_ready(uart_dev)) {
-        printk("Hardware Error: UART device node is not ready!\r\n");
-        return 0;
-    }
-
-    memset(line_buffer, 0, sizeof(line_buffer));
-    for (int i = 0; i < MAX_TARGET_IDS; i++) {
-        active_targets[i] = false;
-    }
-
     printk("\n--> NORDIC SENSOR HUB ONLINE <--\r\n");
+    // Bluetooth is started (and retried until it works) by the BLE sender thread, so a
+    // Bluetooth problem never stops the radar from being read.
 
-    err = init_bluetooth();
-    if (err) {
-        printk("Bluetooth init failed (err %d)\r\n", err);
+    if (!device_is_ready(uart_dev)) {
+        printk("Hardware Error: Radar UART device node is not ready!\r\n");
         return 0;
     }
-    printk("Bluetooth active. Advertising as: '%s'\n", CONFIG_BT_DEVICE_NAME);
-    
+
     err = uart_irq_callback_user_data_set(uart_dev, radar_uart_isr, NULL);
     if (err) {
         printk("Radar UART: interrupt setup failed (err %d)\r\n", err);
@@ -469,24 +806,37 @@ int main(void)
     while (1) {
         k_sem_take(&radar_rx_sem, K_FOREVER);
 
+        atomic_val_t dropped = atomic_clear(&radar_rx_dropped);
+        if (dropped > 0) {
+            printk("Radar UART: RX buffer full, %ld bytes dropped\r\n", (long)dropped);
+        }
+
         while (ring_buf_get(&radar_rx_rb, &rx_byte, 1) == 1) {
             if (rx_byte == '\n' || rx_byte == '\r') {
-                if (buf_idx > 0) {
+                if (discarding) {
+                    printk("Radar UART: over-long line discarded\r\n");
+                    discarding = false;
+                } else if (buf_idx > 0) {
                     line_buffer[buf_idx] = '\0';
-                    printk("RAW UART: %s\r\n", line_buffer);
+                    // Recognised events are logged by the BLE sender ("BLE Sent -> Radar Event"),
+                    // malformed lines by the parser; set RADAR_ECHO_LINES to 1 to see every line.
+                    if (RADAR_ECHO_LINES) {
+                        printk("RAW UART: %s\r\n", line_buffer);
+                    }
                     parse_radar_line(line_buffer);
-                    memset(line_buffer, 0, sizeof(line_buffer));
-                    buf_idx = 0;
                 }
+                buf_idx = 0;
+            } else if (discarding) {
+                // still inside an over-long line; wait for its newline
+            } else if (buf_idx < (MSG_BUFFER_SIZE - 1)) {
+                line_buffer[buf_idx++] = rx_byte;
             } else {
-                if (buf_idx < (MSG_BUFFER_SIZE - 1)) {
-                    line_buffer[buf_idx++] = rx_byte;
-                } else {
-                    buf_idx = 0; // Prevent buffer overflow
-                }
+                // Line too long: drop all of it, not just the start, so its tail
+                // can't be parsed as a separate line.
+                discarding = true;
+                buf_idx = 0;
             }
         }
     }
     return 0;
 }
-
